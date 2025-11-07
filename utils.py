@@ -32,12 +32,6 @@ def make_url(endpoint = None):
         url = f"http://127.0.0.1:8888{endpoint}"
     else:
         url = "http://127.0.0.1:8888"
-    if 'WORKSPACE_ID' in os.environ.keys():
-        lab_id = os.environ['WORKSPACE_ID']
-        if endpoint is not None:
-            url = f"http://{lab_id}.labs.coursera.org{endpoint}"
-        else:
-            url = f"http://{lab_id}.labs.coursera.org"
     BOLD = "\033[1m"
     RESET = "\033[0m"
     
@@ -81,42 +75,73 @@ from openai import OpenAI
 
 os.environ["OPENAI_API_KEY"] = "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"
 
+import boto3
+import json
+from botocore.exceptions import ClientError
+
+
 def generate_with_single_input(
     prompt: str,
-    role: str = 'user',
+    role: str = "user",
     top_p: float = None,
     temperature: float = None,
     max_tokens: int = 500,
-    model: str = "gpt-4o-mini",  # You can set your preferred OpenAI model here
-    **kwargs
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",  # Default Bedrock model
+    region_name: str = "us-east-1",
+    **kwargs,
 ):
     """
-    Generate a chat completion using OpenAI API directly.
+    Generate a text completion using Amazon Bedrock's runtime API.
     """
-    client = OpenAI()
 
-    # Build the payload for chat completion
-    payload = {
-        "model": model,
-        "messages": [{"role": role, "content": prompt}],
+    # Create Bedrock Runtime client
+    client = boto3.client("bedrock-runtime", region_name=region_name)
+
+    # Build the Anthropic (Claude) native Bedrock request format
+    native_request = {
+        "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": role,
+                "content": [{"type": "text", "text": prompt}],
+            }
+        ],
     }
 
-    # Optional params
-    if top_p is not None:
-        payload["top_p"] = top_p
+    # Optional parameters
     if temperature is not None:
-        payload["temperature"] = temperature
+        native_request["temperature"] = temperature
+    if top_p is not None:
+        native_request["top_p"] = top_p
 
-    # Merge any additional kwargs (like presence_penalty, frequency_penalty, etc.)
-    payload.update(kwargs)
+    # Merge additional keyword arguments (e.g., stop_sequences)
+    native_request.update(kwargs)
 
-    # Call OpenAI API
+    # Convert to JSON
+    request_body = json.dumps(native_request)
+
+    # Invoke Bedrock model
     try:
-        response = client.chat.completions.create(**payload)
-        return response.model_dump()  # Convert to dict for backward compatibility
-    except Exception as e:
-        raise RuntimeError(f"OpenAI API request failed: {e}")
+        response = client.invoke_model(modelId=model, body=request_body)
+        model_response = json.loads(response["body"].read())
+
+        # Extract model text output
+        if "content" in model_response and len(model_response["content"]) > 0:
+            output_text = model_response["content"][0].get("text", "")
+        else:
+            output_text = ""
+
+        return {
+            "model": model,
+            "prompt": prompt,
+            "response_text": output_text,
+            "raw_response": model_response,
+        }
+
+    except (ClientError, Exception) as e:
+        raise RuntimeError(f"Bedrock model request failed: {e}")
+
 
 
 
