@@ -1,31 +1,22 @@
 # Importing necessary modules and libraries
-from flask import Flask, request, jsonify
-import ipywidgets as widgets
-from IPython.display import display
 import json
 import logging
 import os
 import re
-import requests
 import threading
-import markdown
-from typing import List, Dict, Any, Union
-from together import Together
-from contextlib import contextmanager
-import subprocess
-from weaviate.classes.query import Filter
-import joblib
-import pandas as pd
 import time
-import httpx
-from openai import OpenAI, DefaultHttpxClient
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import boto3
+import ipywidgets as widgets
+import joblib
+import markdown
+import pandas as pd
+from IPython.display import display
+from botocore.exceptions import ClientError
 from opentelemetry.trace import Status, StatusCode
-
-# Custom transport to bypass SSL verification
-transport = httpx.HTTPTransport(local_address="0.0.0.0", verify=False)
-
-# Create a DefaultHttpxClient instance with the custom transport
-http_client = DefaultHttpxClient(transport=transport)
+from weaviate.classes.query import Filter
 
 def make_url(endpoint = None):
     if endpoint is not None:
@@ -69,174 +60,253 @@ def process_and_print_query(query, correct_label, response_std, tokens_std, resp
     print(f"  Standard    → Label: {label_std_colored} | Tokens: {tokens_std_colored}")
     print(f"  Simplified  → Label: {label_simp_colored} | Tokens: {tokens_simp_colored}\n")
 
-import os
-from openai import OpenAI
+
+BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
 
 
-os.environ["OPENAI_API_KEY"] = "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"
+def _extract_text_from_content(content: Any) -> str:
+    """Normalize message content into a plain string."""
 
-import boto3
-import json
-from botocore.exceptions import ClientError
+    if isinstance(content, str):
+        return content
 
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(str(item["text"]))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text", ""))
+        if "content" in content:
+            return _extract_text_from_content(content.get("content"))
+
+    return "" if content is None else str(content)
+
+
+def _prepare_bedrock_messages(messages: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Split system prompts from messages and convert to Bedrock format."""
+
+    system_messages: List[str] = []
+    formatted_messages: List[Dict[str, Any]] = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        text_content = _extract_text_from_content(message.get("content", ""))
+
+        if role == "system":
+            if text_content:
+                system_messages.append(text_content)
+            continue
+
+        formatted_messages.append(
+            {
+                "role": role,
+                "content": [{"type": "text", "text": text_content}],
+            }
+        )
+
+    if not formatted_messages:
+        raise ValueError("At least one non-system message is required for the Bedrock request.")
+
+    system_prompt = "\n\n".join(system_messages) if system_messages else None
+    return system_prompt, formatted_messages
+
+
+def _coalesce_usage_tokens(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Bedrock usage stats into OpenAI-style token counters."""
+
+    prompt_tokens = usage.get("input_tokens")
+    completion_tokens = usage.get("output_tokens")
+
+    total_tokens: Optional[int] = None
+    token_values = [prompt_tokens, completion_tokens]
+    if any(isinstance(value, (int, float)) for value in token_values):
+        total_tokens = sum(value for value in token_values if isinstance(value, (int, float)))
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _invoke_bedrock_chat(model: str, payload: Dict[str, Any], region_name: str) -> Dict[str, Any]:
+    """Invoke an Amazon Bedrock chat model and normalize the response."""
+
+    client = boto3.client("bedrock-runtime", region_name=region_name)
+
+    try:
+        response = client.invoke_model(modelId=model, body=json.dumps(payload))
+        model_response = json.loads(response["body"].read())
+    except (ClientError, Exception) as exc:
+        raise RuntimeError(f"Bedrock model request failed: {exc}") from exc
+
+    message_text = _extract_text_from_content(model_response.get("content", []))
+    usage = _coalesce_usage_tokens(model_response.get("usage", {}))
+
+    chat_completion = {
+        "id": model_response.get("id"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": model_response.get("role", "assistant"),
+                    "content": message_text,
+                },
+                "finish_reason": model_response.get("stop_reason"),
+            }
+        ],
+        "usage": usage,
+        "raw_response": model_response,
+        "content": message_text,
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+    return chat_completion
 
 def generate_with_single_input(
     prompt: str,
     role: str = "user",
-    top_p: float = None,
-    temperature: float = None,
+    top_p: Optional[float] = None,
+    temperature: Optional[float] = None,
     max_tokens: int = 500,
-    model: str = "anthropic.claude-3-haiku-20240307-v1:0",  # Default Bedrock model
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",
     region_name: str = "us-east-1",
     **kwargs,
-):
-    """
-    Generate a text completion using Amazon Bedrock's runtime API.
-    """
+) -> Dict[str, Any]:
+    """Generate a chat completion for a single prompt using Amazon Bedrock."""
 
-    # Create Bedrock Runtime client
-    client = boto3.client("bedrock-runtime", region_name=region_name)
+    messages = [{"role": role, "content": prompt}]
+    return generate_with_multiple_input(
+        messages=messages,
+        top_p=top_p,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model=model,
+        region_name=region_name,
+        **kwargs,
+    )
 
-    # Build the Anthropic (Claude) native Bedrock request format
-    native_request = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": max_tokens,
-        "messages": [
-            {
-                "role": role,
-                "content": [{"type": "text", "text": prompt}],
-            }
-        ],
+
+def generate_with_multiple_input(
+    messages: List[Dict[str, Any]],
+    top_p: Optional[float] = 1,
+    temperature: Optional[float] = 1,
+    max_tokens: int = 500,
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",
+    region_name: str = "us-east-1",
+    **kwargs,
+) -> Dict[str, Any]:
+    """Generate a chat completion for multiple messages using Amazon Bedrock."""
+
+    system_prompt, formatted_messages = _prepare_bedrock_messages(messages)
+
+    payload: Dict[str, Any] = {
+        "anthropic_version": BEDROCK_ANTHROPIC_VERSION,
+        "messages": formatted_messages,
     }
 
-    # Optional parameters
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     if temperature is not None:
-        native_request["temperature"] = temperature
+        payload["temperature"] = temperature
     if top_p is not None:
-        native_request["top_p"] = top_p
+        payload["top_p"] = top_p
+    if system_prompt:
+        payload["system"] = system_prompt
 
-    # Merge additional keyword arguments (e.g., stop_sequences)
-    native_request.update(kwargs)
+    payload.update(kwargs)
 
-    # Convert to JSON
-    request_body = json.dumps(native_request)
-
-    # Invoke Bedrock model
-    try:
-        response = client.invoke_model(modelId=model, body=request_body)
-        model_response = json.loads(response["body"].read())
-
-        # Extract model text output
-        if "content" in model_response and len(model_response["content"]) > 0:
-            output_text = model_response["content"][0].get("text", "")
-        else:
-            output_text = ""
-
-        return {
-            "model": model,
-            "prompt": prompt,
-            "response_text": output_text,
-            "raw_response": model_response,
-        }
-
-    except (ClientError, Exception) as e:
-        raise RuntimeError(f"Bedrock model request failed: {e}")
-
-
-
-
-from typing import List, Dict
-import os
-from openai import OpenAI
-
-def generate_with_multiple_input(messages: List[Dict], top_p: float = 1, temperature: float = 1, max_tokens: int = 500,
-                                 model: str = "gpt-4o-mini", together_api_key=None, **kwargs):
-    payload = {
-        "model": model,
-        "messages": messages,
-        "top_p": top_p,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        **kwargs
-    }
-
-    try:
-        # Initialize OpenAI client (no proxy or Together API)
-        client = OpenAI()
-
-        # Generate completion
-        json_dict = client.chat.completions.create(**payload).model_dump()
-
-    except Exception as e:
-        raise Exception(f"Failed to get correct output from LLM call.\nException: {e}")
-
-    try:
-        output_dict = json_dict
-    except Exception as e:
-        raise Exception(f"Failed to get correct output dict. Please try again. Error: {e}")
-
-    return output_dict
+    return _invoke_bedrock_chat(model=model, payload=payload, region_name=region_name)
 
 
 def generate_params_dict(
-    prompt: str, 
-    temperature: float = None, 
-    role='user',
-    top_p: float = None,
+    prompt: str,
+    temperature: Optional[float] = None,
+    role: str = "user",
+    top_p: Optional[float] = None,
     max_tokens: int = 500,
-    model: str = "gpt-4.1"
-):
-    """
-    Call an OpenAI LLM with different sampling parameters to observe their effects.
-    
-    Args:
-        prompt: The text prompt to send to the model
-        temperature: Controls randomness (lower = more deterministic)
-        top_p: Controls diversity via nucleus sampling
-        max_tokens: Maximum number of tokens to generate
-        model: The model to use (OpenAI model)
-        
-    Returns:
-        A dictionary of parameters for OpenAI API call
-    """
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",
+    region_name: str = "us-east-1",
+    **kwargs,
+) -> Dict[str, Any]:
+    """Prepare a parameter dictionary for invoking an Amazon Bedrock chat model."""
 
-    # Create the dictionary with OpenAI-compatible parameters
-    kwargs = {
+    params: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": role, "content": prompt}],
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens
+        "max_tokens": max_tokens,
+        "region_name": region_name,
     }
 
-    return kwargs
+    if temperature is not None:
+        params["temperature"] = temperature
+    if top_p is not None:
+        params["top_p"] = top_p
+
+    params.update(kwargs)
+
+    return params
 
 
+def generate_embedding(
+    prompt: Union[str, List[str]],
+    model: str = "amazon.titan-embed-text-v2:0",
+    region_name: str = "us-east-1",
+    **kwargs,
+):
+    """Generate embeddings using an Amazon Bedrock embedding model."""
 
-def generate_embedding(prompt: str, model: str = "text-embedding-3-small", api_key: str = "", **kwargs):
-    """
-    Generate an embedding using the OpenAI API.
+    client = boto3.client("bedrock-runtime", region_name=region_name)
 
-    Args:
-        prompt (str): The text to generate an embedding for.
-        model (str): The OpenAI embedding model to use (default: text-embedding-3-small).
-        api_key (str, optional): OpenAI API key. If not provided, uses environment variable OPENAI_API_KEY.
-        **kwargs: Additional arguments to pass to the API call.
+    if isinstance(prompt, str):
+        inputs = [prompt]
+        single_input = True
+    elif isinstance(prompt, list):
+        inputs = prompt
+        single_input = False
+    else:
+        raise ValueError("prompt must be a string or a list of strings.")
 
-    Returns:
-        list[float]: The embedding vector.
-    """
-    client = OpenAI()
+    embeddings: List[List[float]] = []
 
-    try:
-        response = client.embeddings.create(
-            model=model,
-            input=prompt,
-            **kwargs
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate embedding: {e}")
+    for text in inputs:
+        body = {"inputText": text}
+        body.update(kwargs)
+
+        try:
+            response = client.invoke_model(modelId=model, body=json.dumps(body))
+            payload = json.loads(response["body"].read())
+        except (ClientError, Exception) as exc:
+            raise RuntimeError(f"Failed to generate embedding: {exc}") from exc
+
+        embedding = None
+        if isinstance(payload.get("embedding"), list):
+            embedding = payload["embedding"]
+        elif isinstance(payload.get("embeddings"), list):
+            # Some models return a list of embeddings for batch inputs.
+            embeddings_list = payload["embeddings"]
+            embedding = embeddings_list[0] if embeddings_list else None
+        elif isinstance(payload.get("results"), list) and payload["results"]:
+            embedding = payload["results"][0].get("embedding")
+
+        if embedding is None:
+            raise RuntimeError("Bedrock embedding response did not include an embedding vector.")
+
+        embeddings.append(embedding)
+
+    return embeddings[0] if single_input else embeddings
 
 
 class ChatBot:
@@ -247,7 +317,7 @@ class ChatBot:
     to generate responses related to a clothing store.
     """
 
-    def __init__(self, generator_function, tracer, model: str = "gpt-4o-mini", context_window: int = 20):
+    def __init__(self, generator_function, tracer, model: str = "anthropic.claude-3-haiku-20240307-v1:0", region_name: str = "us-east-1", context_window: int = 20):
         # Initialize system and greeting messages
         self.system_prompt = {
             'role': 'system', 
@@ -268,6 +338,7 @@ class ChatBot:
         self.conversation: List[Dict[str, str]] = [self.system_prompt, self.initial_message]
         self.context_window = context_window  # Limit of past messages to consider
         self.model = model  # Model name to use for inference
+        self.region_name = region_name
         self.kwargs_list = []
 
 
@@ -275,16 +346,15 @@ class ChatBot:
         """
         Calls the language model API with the provided messages and parameters.
         """
-        client = OpenAI()
         try:
-            response = client.chat.completions.create(
-                model=self.model,
+            return generate_with_multiple_input(
                 messages=messages,
                 temperature=temperature,
                 top_p=top_p,
-                max_tokens=max_tokens  # OpenAI uses this param instead of max_tokens
+                max_tokens=max_tokens,
+                model=self.model,
+                region_name=self.region_name,
             )
-            return response.model_dump()
         except Exception as e:
             print(f"[Error] LLM API call failed: {e}")
             return {"error": str(e)}
@@ -301,8 +371,10 @@ class ChatBot:
             span.set_attribute("agent.recent_context", str(recent_context))
             params_dict, total_tokens = self.generator_function(prompt)  # Build API query parameters
             #params_dict['model'] = 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo'
+            params_dict.setdefault("model", self.model)
+            params_dict.setdefault("region_name", self.region_name)
             self.kwargs_list.append(params_dict)
-            with self.tracer.start_as_current_span("llm_call", openinference_span_kind="llm") as llm_span:      
+            with self.tracer.start_as_current_span("llm_call", openinference_span_kind="llm") as llm_span:
                 try:
                     response = call_llm_with_context(context=recent_context, **params_dict)# Get response from model
                     llm_span.set_input({"messages":recent_context, **params_dict})
@@ -318,7 +390,7 @@ class ChatBot:
                     llm_span.set_attribute("llm.token_count.completion", response['usage']['completion_tokens'])
                     llm_span.set_attribute("llm.token_count.total", response['usage']['total_tokens'])
                     llm_span.set_attribute("llm.model_name", response['model'])
-                    llm_span.set_attribute("llm.provider", 'together.ai')
+                    llm_span.set_attribute("llm.provider", 'aws.bedrock')
                     llm_span.set_output(response)
                     llm_span.set_status(Status(StatusCode.OK))
                     
@@ -514,11 +586,25 @@ def call_llm_with_context(prompt: str, context: list, role: str = 'user', **kwar
     - context (list): A list representing the conversation history, to which the new input is added.
     - **kwargs: Additional keyword arguments for configuring the language model call (e.g., top_k, temperature).
     Returns:
-    - response (str): The generated response from the language model based on the provided prompt and context.
+    - response (dict): The generated response from the language model based on the provided prompt and context.
     """
+
+    request_kwargs = dict(kwargs)
+    # Remove unused "messages" payloads that may be provided by helper functions.
+    request_kwargs.pop("messages", None)
+
     context.append({'role': role, 'content': prompt})
-    response = generate_with_multiple_input(context, **kwargs)
-    context.append(response)
+    response = generate_with_multiple_input(context, **request_kwargs)
+
+    if response.get("choices"):
+        assistant_message = response["choices"][0].get("message", {})
+        context.append(
+            {
+                'role': assistant_message.get('role', 'assistant'),
+                'content': assistant_message.get('content', ''),
+            }
+        )
+
     return response
 
 def print_properties(item):
