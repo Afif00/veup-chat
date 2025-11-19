@@ -1,0 +1,74 @@
+# ----------------------------------------
+# JUPYTER NOTEBOOK
+# ----------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Jupyter runtime files
+.jupyter/
+.jupyter_cache/
+
+# JupyterLab build artifacts
+lab/
+.jupyterlab-settings/
+
+# ----------------------------------------
+# PYTHON
+# ----------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.pdb
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ----------------------------------------
+# DATA FILES (OPTIONAL—UNCOMMENT IF NEEDED)
+# Large or private datasets
+# data/
+# *.csv
+# *.tsv
+# *.parquet
+# *.h5
+# *.zip
+
+# ----------------------------------------
+# OS / IDE / EDITOR
+# ----------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VSCode
+.vscode/
+.history/
+
+# PyCharm / JetBrains
+.idea/
+
+# ----------------------------------------
+# LOGS / TEMP
+# ----------------------------------------
+*.log
+*.tmp
+*.swp
+*.bak
