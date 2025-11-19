@@ -19,6 +19,137 @@ from botocore.exceptions import ClientError
 from opentelemetry.trace import Status, StatusCode
 from weaviate.classes.query import Filter
 
+import boto3
+import json
+from typing import List, Optional
+from botocore.exceptions import ClientError
+
+import boto3
+import json
+from botocore.exceptions import ClientError
+
+
+def ask_claude(
+    message: str,
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",
+    region_name: str = "us-east-1",
+    temperature: float = 0.5,
+    top_p: float = 1.0,
+    max_tokens: int = 512,
+):
+    """
+    Sends a message to an Anthropic Claude model on AWS Bedrock and returns the response text.
+
+    Parameters:
+        message (str): The user message or prompt to send.
+        model (str): The Claude model ID to use. Defaults to Claude 3 Haiku.
+        region_name (str): AWS region. Defaults to 'us-east-1'.
+        temperature (float): Sampling temperature. Higher = more creative.
+        top_p (float): Top-p sampling value for nucleus sampling.
+        max_tokens (int): Maximum number of tokens to generate.
+
+    Returns:
+        str: The model's response text.
+    """
+    # Create Bedrock Runtime client
+    client = boto3.client("bedrock-runtime", region_name=region_name)
+
+    # Format the request payload
+    native_request = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": message}],
+            }
+        ],
+    }
+
+    # Convert request to JSON
+    request_body = json.dumps(native_request)
+    try:
+        # Invoke the model
+        response = client.invoke_model(modelId=model, body=request_body)
+
+        # Decode the response
+        model_response = json.loads(response["body"].read())
+
+        # Return the model’s text output
+        return model_response["content"][0]["text"]
+
+    except (ClientError, Exception) as e:
+        print(f"ERROR: Can't invoke '{model}'. Reason: {e}")
+        return None
+
+
+def ask_claude_multiple(
+    messages: List[str],
+    model: str = "anthropic.claude-3-haiku-20240307-v1:0",
+    region_name: str = "us-east-1",
+    temperature: float = 0.5,
+    top_p: float = 1.0,
+    max_tokens: int = 512,
+) -> Optional[str]:
+    """
+    Sends multiple messages to an Anthropic Claude model on AWS Bedrock and returns the response text.
+
+    Parameters:
+        messages (List[str]): A list of user messages or prompts to send in sequence.
+        model (str): The Claude model ID to use. Defaults to Claude 3 Haiku.
+        region_name (str): AWS region. Defaults to 'us-east-1'.
+        temperature (float): Sampling temperature. Higher = more creative.
+        top_p (float): Top-p sampling value for nucleus sampling.
+        max_tokens (int): Maximum number of tokens to generate.
+
+    Returns:
+        str or None: The model's combined response text, or None on error.
+    """
+    # Create Bedrock Runtime client
+    client = boto3.client("bedrock-runtime", region_name=region_name)
+
+    # Build the Bedrock-compatible message list
+    bedrock_messages = []
+    for msg in messages:
+        bedrock_messages.append({
+            "role": "user",
+            "content": [{"type": "text", "text": msg}],
+        })
+
+    # Format the request payload
+    native_request = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "messages": bedrock_messages,
+    }
+
+    try:
+        # Invoke the model
+        response = client.invoke_model(
+            modelId=model,
+            body=json.dumps(native_request),
+        )
+
+        # Decode the response
+        model_response = json.loads(response["body"].read())
+
+        # Combine text outputs (Claude returns a list of content blocks)
+        parts = []
+        for block in model_response.get("content", []):
+            if block.get("type") == "text":
+                parts.append(block.get("text", ""))
+
+        return "\n".join(parts).strip()
+
+    except (ClientError, Exception) as e:
+        print(f"ERROR: Can't invoke '{model}'. Reason: {e}")
+        return None
+
+
 def make_url(endpoint = None):
     if endpoint is not None:
         url = f"http://127.0.0.1:8888{endpoint}"
@@ -218,7 +349,7 @@ def generate_with_multiple_input(
 
     # Call Claude via Bedrock using the helper function
     response_text = ask_claude_multiple(
-        message=message_text.strip(),
+        messages=[message_text.strip()],
         model=model,
         region_name=region_name,
         temperature=temperature,
@@ -393,7 +524,6 @@ class ChatBot:
             # Get response from model
             response = call_llm_with_context(context=recent_context, **params_dict)
             content = response['choices'][0]['message']['content']
-            total_tokens = response['usage']['total_tokens']
         except Exception as error:
             logging.exception("LLM call failed", error)
             raise
@@ -474,7 +604,7 @@ class ChatWidget:
         """Gets the response from the bot and updates the UI accordingly."""
         try:
             response = self.chat_bot.chat(user_message)
-            response_content = response['content']
+            response_content = response
             self.extract_and_process_ids(response_content)
             self.refresh_messages()  # refresh only on success
         except Exception as exc:
@@ -499,17 +629,39 @@ class ChatWidget:
 
         self.output_area.value = self.output_area.value + err_html
 
-    def extract_and_process_ids(self, message: str):
-        """
-        Finds and processes any 'ID: <number>' entries in the message to load images.
-        """
-        pattern = re.compile(r'ID:\s*(\d+(?:,\s*\d+)*)', re.IGNORECASE)
+    def extract_and_process_ids(self, message: Union[str, dict, list]):
+        # Normalize message to a single string
+        if isinstance(message, dict):
+            message = message.get("content") or message.get("text") or json.dumps(message)
+        elif isinstance(message, list):
+            parts = []
+            for m in message:
+                if isinstance(m, str):
+                    parts.append(m)
+                elif isinstance(m, dict):
+                    c = m.get("content") or m.get("text")
+                    if isinstance(c, str):
+                        parts.append(c)
+            message = " ".join(parts)
+        elif not isinstance(message, str):
+            message = str(message)
+    
+        # If we still don't have a string, bail out
+        if not isinstance(message, str):
+            return
+    
+        # Find "ID: 1, 2, 3" patterns (commas with optional spaces)
+        pattern = re.compile(r'\bID:\s*(\d+(?:\s*,\s*\d+)*)', re.IGNORECASE)
         matches = pattern.findall(message)
-        found_ids = [id.strip() for match in matches for id in match.split(',')]
-        for id in found_ids:
-            if id not in self.unique_ids:
-                self.unique_ids.add(id)
-                self.load_image(id)
+    
+        found_ids = []
+        for group in matches:
+            found_ids.extend([id_.strip() for id_ in re.split(r'\s*,\s*', group)])
+    
+        for id_ in found_ids:
+            if id_ and id_ not in self.unique_ids:
+                self.unique_ids.add(id_)
+                self.load_image(id_)
 
     def load_image(self, id: str):
         """
@@ -603,7 +755,7 @@ def print_object_properties(obj: Union[dict, list]) -> None:
             t += "\n\n"
     print(t)
 
-def call_llm_with_context(prompt: str, context: list, role: str = 'user', **kwargs):
+def call_llm_with_context(message: str, context: list, role: str = 'user', **kwargs):
     """
     Calls a language model with the given prompt and context to generate a response.
     Parameters:
@@ -619,15 +771,15 @@ def call_llm_with_context(prompt: str, context: list, role: str = 'user', **kwar
     # Remove unused "messages" payloads that may be provided by helper functions.
     request_kwargs.pop("messages", None)
 
-    context.append({'role': role, 'content': prompt})
+    context.append({'role': role, 'content': message})
     response = generate_with_multiple_input(context, **request_kwargs)
 
     if response.get("choices"):
-        assistant_message = response["choices"][0].get("message", {})
+        assistant_message = response
         context.append(
             {
-                'role': assistant_message.get('role', 'assistant'),
-                'content': assistant_message.get('content', ''),
+                'role': 'assistant',
+                'content': assistant_message,
             }
         )
 
